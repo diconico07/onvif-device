@@ -11,10 +11,87 @@ use futures::{stream::FuturesOrdered, StreamExt};
 use tower_service::Service;
 use xmltree::Element;
 
-type SoapMessage = xmltree::Element;
-type SoapError = String;
-type BoxedSoapFuture = Pin<Box<dyn Future<Output = Result<SoapMessage, SoapError>> + Send>>;
-type BoxedSoapHandlerService = tower::util::BoxCloneService<SoapMessage, SoapMessage, SoapError>;
+use crate::fault::SoapFault;
+
+pub struct SoapRequest {
+    pub headers: xmltree::Element,
+    pub body: xmltree::Element,
+}
+pub struct SoapMessage(pub xmltree::Element);
+
+impl Default for SoapMessage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SoapMessage {
+    pub fn new() -> Self {
+        let mut env = Element::new("Enveloppe");
+        env.namespace = Some("http://www.w3.org/2003/05/soap-envelope".to_string());
+        let mut namespaces = xmltree::Namespace::empty();
+        namespaces.put("xml", "http://www.w3.org/XML/1998/namespace");
+        namespaces.put("env", "http://www.w3.org/2003/05/soap-envelope");
+        env.namespaces = Some(namespaces);
+        let mut body = Element::new("Body");
+        body.prefix = Some("env".to_string());
+        env.children.push(xmltree::XMLNode::Element(body));
+        Self(env)
+    }
+
+    pub fn get_body(&self) -> &xmltree::Element {
+        self.0
+            .get_child(("Body", "http://www.w3.org/2003/05/soap-envelope"))
+            .unwrap()
+    }
+
+    pub fn get_headers(&self) -> Option<&xmltree::Element> {
+        self.0
+            .get_child(("Header", "http://www.w3.org/2003/05/soap-envelope"))
+    }
+
+    pub fn get_mut_body(&mut self) -> &mut xmltree::Element {
+        self.0
+            .get_mut_child(("Body", "http://www.w3.org/2003/05/soap-envelope"))
+            .unwrap()
+    }
+
+    pub fn get_mut_headers(&mut self) -> &mut xmltree::Element {
+        if self.get_headers().is_none() {
+            let mut h = Element::new("Headers");
+            h.prefix = Some("env".to_string());
+            self.0.children.insert(0, xmltree::XMLNode::Element(h));
+        }
+        self.0
+            .get_mut_child(("Header", "http://www.w3.org/2003/05/soap-envelope"))
+            .unwrap()
+    }
+}
+
+impl From<xmltree::Element> for SoapMessage {
+    fn from(value: xmltree::Element) -> Self {
+        Self(value)
+    }
+}
+
+impl From<SoapMessage> for xmltree::Element {
+    fn from(val: SoapMessage) -> xmltree::Element {
+        val.0
+    }
+}
+
+impl<Y, Z> From<(Y, Z)> for SoapMessage
+where
+    Y: Into<SoapMessage>,
+    Z: Into<SoapMessage>,
+{
+    fn from(val: (Y, Z)) -> SoapMessage {
+        SoapMessage(merge_soap_enveloppe(val.0.into().0, val.1.into().0))
+    }
+}
+
+type BoxedSoapFuture = Pin<Box<dyn Future<Output = Result<SoapMessage, SoapFault>> + Send>>;
+type BoxedSoapHandlerService = tower::util::BoxCloneService<SoapRequest, SoapMessage, SoapFault>;
 
 #[derive(Clone)]
 struct SoapHandlerService<S, H>
@@ -34,12 +111,12 @@ where
     }
 }
 
-impl<S, H> Service<SoapMessage> for SoapHandlerService<S, H>
+impl<S, H> Service<SoapRequest> for SoapHandlerService<S, H>
 where
     H: SoapHandler<S>,
     S: Clone,
 {
-    type Error = SoapError;
+    type Error = SoapFault;
     type Response = SoapMessage;
 
     type Future = BoxedSoapFuture;
@@ -51,22 +128,22 @@ where
         Ok(()).into()
     }
 
-    fn call(&mut self, req: SoapMessage) -> Self::Future {
+    fn call(&mut self, req: SoapRequest) -> Self::Future {
         self.handler.clone().call(&req, self.state.clone())
     }
 }
 
 pub trait SoapHandler<S>: 'static + Send + Sync + Clone {
-    fn call(self, req: &SoapMessage, state: S) -> BoxedSoapFuture;
+    fn call(self, req: &SoapRequest, state: S) -> BoxedSoapFuture;
 }
 
 impl<F, Fut, Res, S> SoapHandler<S> for F
 where
     F: FnOnce() -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Result<Res, SoapError>> + Send,
+    Fut: Future<Output = Result<Res, SoapFault>> + Send,
     Res: Into<SoapMessage>,
 {
-    fn call(self, _req: &SoapMessage, _state: S) -> BoxedSoapFuture {
+    fn call(self, _req: &SoapRequest, _state: S) -> BoxedSoapFuture {
         Box::pin(async move { Ok(self().await?.into()) })
     }
 }
@@ -103,7 +180,7 @@ where
         self
     }
 
-    async fn parse_request(&self, req: Request<Body>) -> Result<xmltree::Element, String> {
+    async fn parse_request(&self, req: Request<Body>) -> Result<SoapMessage, String> {
         let state = self.state.clone();
         let body = Bytes::from_request(req, &state).await.unwrap();
         let xml_body = xmltree::Element::parse(body.as_ref()).unwrap();
@@ -118,7 +195,7 @@ where
         {
             return Err("Malformed SOAP Message".to_string());
         }
-        Ok(xml_body)
+        Ok(xml_body.into())
     }
 
     async fn call_internal(&self, req: Request<Body>) -> Result<Response, Infallible> {
@@ -132,9 +209,15 @@ where
                     .unwrap());
             }
         };
-        let soap_body = soap_req
-            .get_child(("Body", "http://www.w3.org/2003/05/soap-envelope"))
-            .unwrap();
+        let soap_body = soap_req.get_body();
+        let soap_headers = match soap_req.get_headers() {
+            None => {
+                let mut e = Element::new("Header");
+                e.namespace = Some("http://www.w3.org/2003/05/soap-envelope".to_string());
+                e
+            }
+            Some(h) => h.clone(),
+        };
         let mut fut = FuturesOrdered::new();
         for elem in soap_body.children.iter() {
             let elem = elem.as_element();
@@ -146,14 +229,17 @@ where
                 elem.namespace.clone().unwrap_or_default(),
                 elem.name.clone(),
             )) {
-                fut.push_back(handler.clone().call(soap_req.clone()));
+                fut.push_back(handler.clone().call(SoapRequest {
+                    headers: soap_headers.clone(),
+                    body: elem.clone(),
+                }));
             }
         }
         if fut.is_empty() {
             // Handle operations not found
             todo!()
         }
-        let soap_reponses: Vec<xmltree::Element> = fut.map(|e| e.unwrap()).collect().await;
+        let soap_reponses: Vec<xmltree::Element> = fut.map(|e| e.unwrap().0).collect().await;
 
         let merged_response = soap_reponses
             .into_iter()

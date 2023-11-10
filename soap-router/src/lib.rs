@@ -1,3 +1,4 @@
+pub mod fault;
 pub mod router;
 
 pub fn add(left: usize, right: usize) -> usize {

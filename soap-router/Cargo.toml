@@ -10,7 +10,10 @@ axum = "0.6.20"
 bytes = "1.5.0"
 futures = "0.3.29"
 hyper = "0.14.27"
+isolang = { version = "2.3.0", default-features = false }
+strum_macros = "0.25.3"
 tokio = { version = "1.33.0", features = ["test-util", "full"] }
 tower = { version = "0.4.13", features = ["util"] }
 tower-service = "0.3.2"
+url = "2.4.1"
 xmltree = "0.10.3"
